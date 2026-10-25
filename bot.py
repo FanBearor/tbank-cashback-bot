@@ -300,4 +300,266 @@ def update_posts_cache():
 
 def get_filtered_posts(category=None, tier="all"):
     """
-    СТРОГАЯ ФИ
+    СТРОГАЯ ФИЛЬТРАЦИЯ ОТ МОМЕНТА ЗАПРОСА:
+    - category='day': ТОЛЬКО посты, опубликованные СЕГОДНЯ (в день запроса).
+    - category='week' / 'goods': строго за последние 7 дней от момента запроса.
+    """
+    now_msk = datetime.now(MSK)
+    week_limit = now_msk - timedelta(days=7)
+    today_date = now_msk.date()
+
+    result = []
+    for p in cached_posts:
+        pub_dt = p.get("datetime")
+        if not pub_dt:
+            continue
+
+        pub_msk = pub_dt.astimezone(MSK)
+
+        # ================= СТРОГОЕ ПРАВИЛО ДЛЯ АКЦИЙ ДНЯ =================
+        if category == "day":
+            # 1. Пост должен быть категорией 'day'
+            if p["category"] != "day":
+                continue
+            # 2. Дата публикации ДОЛЖНА БЫТЬ СТРОГО СЕГОДНЯШНИМ ДНЕМ!
+            if pub_msk.date() != today_date:
+                continue
+
+            result.append(p)
+            continue
+
+        # ================= ПРАВИЛО ДЛЯ ОСТАЛЬНЫХ КАТЕГОРИЙ =================
+        # Строго в пределах 7 дней от секунды запроса
+        if pub_msk < week_limit or pub_msk > now_msk:
+            continue
+
+        # Проверка дедлайна 'до ДД.ММ'
+        until_match = re.search(r'(?:до|по)\s+(\d{1,2})\.(\d{1,2})', p["text"].lower())
+        if until_match:
+            try:
+                d, m = int(until_match.group(1)), int(until_match.group(2))
+                year = now_msk.year
+                if m < now_msk.month and now_msk.month == 12:
+                    year += 1
+                expiry_date = datetime(year, m, d, 23, 59, 59, tzinfo=MSK)
+                if now_msk > expiry_date:
+                    continue
+            except Exception:
+                pass
+
+        if category and p["category"] != category:
+            continue
+
+        pct = p["percent"]
+        if tier == "80_100" and pct < 80:
+            continue
+        elif tier == "50_80" and not (50 <= pct < 80):
+            continue
+        elif tier == "0_50" and pct >= 50:
+            continue
+
+        result.append(p)
+
+    # Ранжирование: сначала самый большой %, затем новизна
+    result.sort(
+        key=lambda x: (x["percent"], x["datetime"]),
+        reverse=True
+    )
+    return result
+
+def format_card(p, now_msk):
+    """Карточка акции с точным временем и возрастом"""
+    cat = p["category"]
+    pct = p["percent"]
+    ch = p["channel"]
+    dt = p["datetime"]
+
+    cat_title = {
+        "day": "🔥 АКЦИЯ ДНЯ (СЕГОДНЯ)",
+        "goods": "🛒 ТОВАР С КЭШБЭКОМ",
+        "week": "📅 АКЦИЯ ЗА НЕДЕЛЮ"
+    }.get(cat, "⚡ ВЫГОДНОЕ ПРЕДЛОЖЕНИЕ")
+
+    pct_badge = f" • <b>{pct}% Выгода/Кэшбэк</b>" if pct > 0 else ""
+    pub_msk = dt.astimezone(MSK) if dt else None
+    date_str = pub_msk.strftime("%d.%m.%Y в %H:%M") if pub_msk else "Недавно"
+    rel_str = format_relative_time(dt, now_msk)
+
+    header = f"<b>{cat_title}</b>{pct_badge}\n<i>🕒 Опубликовано: {date_str} ({rel_str}) • @{ch}</i>\n\n"
+    source = f"\n\n👉 <a href='https://t.me/{p['post_ref']}'>Открыть предложение в источнике</a>"
+
+    max_len = 3900 - len(header) - len(source)
+    txt = p["text"]
+    if len(txt) > max_len:
+        txt = txt[:max_len] + "..."
+
+    return header + txt + source
+
+def send_batch(chat_id, posts, empty_text, now_msk, limit=6):
+    if not posts:
+        send_msg(chat_id, empty_text, get_main_keyboard())
+        return
+
+    send_msg(chat_id, f"🔎 Найдено предложений: <b>{len(posts)}</b>", get_main_keyboard())
+    for p in posts[:limit]:
+        send_msg(chat_id, format_card(p, now_msk))
+        time.sleep(0.3)
+
+# ==================== ФОНОВЫЙ МОНИТОРИНГ ====================
+def monitor_loop():
+    """Фоновый мониторинг раз в 2 часа"""
+    update_posts_cache()
+    known_ids = {p["post_ref"] for p in cached_posts}
+
+    while True:
+        try:
+            time.sleep(CHECK_INTERVAL_SECONDS)
+            prev_ids = set(known_ids)
+            update_posts_cache()
+
+            now_msk = datetime.now(MSK)
+            for p in cached_posts:
+                if p["post_ref"] not in prev_ids:
+                    known_ids.add(p["post_ref"])
+                    # Новая акция дня уведомляет мгновенно
+                    pub_msk = p["datetime"].astimezone(MSK) if p.get("datetime") else None
+                    if p["category"] == "day" and pub_msk and pub_msk.date() == now_msk.date():
+                        send_msg(CHAT_ID, "🚨 <b>НОВАЯ АКЦИЯ ДНЯ!</b>\n\n" + format_card(p, now_msk))
+        except Exception as e:
+            print(f"Ошибка в monitor_loop: {e}")
+            time.sleep(30)
+
+# ==================== ОБРАБОТКА КОМАНД И КНОПОК ====================
+def bot_updates_loop():
+    offset = 0
+    while True:
+        try:
+            if time.time() - last_cache_update > 900 and last_cache_update > 0:
+                update_posts_cache()
+
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
+            res = requests.get(url, timeout=25).json()
+            if not res.get("ok"):
+                time.sleep(3)
+                continue
+
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                now_msk = datetime.now(MSK)
+                week_start = now_msk - timedelta(days=7)
+                today_str = now_msk.strftime("%d.%m.%Y")
+
+                # 1. Инлайн-кнопки (ранжирование)
+                if "callback_query" in upd:
+                    cq = upd["callback_query"]
+                    cq_id = cq["id"]
+                    cq_data = cq.get("data", "")
+                    chat_id = cq.get("message", {}).get("chat", {}).get("id")
+                    answer_callback(cq_id)
+
+                    tier_names = {"80_100": "80% — 100%", "50_80": "50% — 80%", "0_50": "до 50%", "all": "все"}
+
+                    if cq_data.startswith("week_"):
+                        tier = cq_data.replace("week_", "")
+                        posts = get_filtered_posts(category="week", tier=tier)
+                        send_msg(
+                            chat_id,
+                            f"📅 <b>Акции за последние 7 дней ({week_start.strftime('%d.%m')} — {now_msk.strftime('%d.%m')}):\nКэшбэк: {tier_names.get(tier, tier)}</b>"
+                        )
+                        send_batch(chat_id, posts, f"😔 В диапазоне {tier_names.get(tier)} за последние 7 дней акций не найдено.", now_msk)
+
+                    elif cq_data.startswith("goods_"):
+                        tier = cq_data.replace("goods_", "")
+                        posts = get_filtered_posts(category="goods", tier=tier)
+                        send_msg(
+                            chat_id,
+                            f"🛒 <b>Товары с кэшбэком за последние 7 дней ({week_start.strftime('%d.%m')} — {now_msk.strftime('%d.%m')}):\nВыгода: {tier_names.get(tier, tier)}</b>"
+                        )
+                        send_batch(chat_id, posts, f"😔 В диапазоне {tier_names.get(tier)} за последние 7 дней товаров не найдено.", now_msk)
+                    continue
+
+                # 2. Текстовые сообщения
+                msg = upd.get("message", {})
+                text = msg.get("text", "").strip()
+                chat_id = msg.get("chat", {}).get("id")
+
+                if not chat_id or not text:
+                    continue
+
+                if text == "/start":
+                    start_text = (
+                        "👋 <b>Привет! Бот кэшбэка и акций обновлен!</b>\n\n"
+                        "⚡ <b>Правила работы:</b>\n"
+                        f"• <b>Акции дня:</b> СТРОГО опубликованные <b>сегодня ({today_str})</b>.\n"
+                        f"• <b>Акции недели и товары:</b> СТРОГО за <b>последние 7 дней</b> от момента запроса.\n"
+                        "🌐 <b>Источники:</b> Т-Банк, Pepper.ru, Халявщики, Промокоды.\n\n"
+                        "Выбирай нужный раздел в меню 👇"
+                    )
+                    send_msg(chat_id, start_text, get_main_keyboard())
+
+                elif "Акции дня" in text:
+                    posts = get_filtered_posts(category="day", tier="all")
+                    if not posts:
+                        send_msg(
+                            chat_id,
+                            f"😔 <b>На сегодня ({today_str}) новых акций дня пока не опубликовано.</b>\n\n"
+                            "Обычно банк выкладывает их в приложении и каналах утром или днем.\n"
+                            "Как только акция дня выйдет — бот сразу её пришлет!",
+                            get_main_keyboard()
+                        )
+                    else:
+                        send_batch(
+                            chat_id,
+                            posts,
+                            f"😔 На сегодня ({today_str}) акций дня пока нет.",
+                            now_msk
+                        )
+
+                elif any(k in text for k in ["Акции недели", "Акции месяца", "акции за неделю"]):
+                    send_msg(
+                        chat_id,
+                        f"📅 <b>Акции за последние 7 дней (с {week_start.strftime('%d.%m')} по {now_msk.strftime('%d.%m.%Y')}):</b>\n"
+                        "Выбери желаемый процент кэшбэка / выгоды 👇",
+                        get_tier_inline_keyboard("week")
+                    )
+
+                elif "Товары с кэшбэком" in text:
+                    send_msg(
+                        chat_id,
+                        f"🛒 <b>Товары с кэшбэком за последние 7 дней (с {week_start.strftime('%d.%m')} по {now_msk.strftime('%d.%m.%Y')}):</b>\n"
+                        "Выбери желаемый процент выгоды 👇",
+                        get_tier_inline_keyboard("goods")
+                    )
+
+                elif any(k in text for k in ["Все акции", "Все акции за неделю", "Все акции сразу"]):
+                    posts = get_filtered_posts(tier="all")
+                    send_batch(chat_id, posts, "😔 Акций за последние 7 дней не найдено.", now_msk, limit=8)
+
+                elif "Обновить базу" in text or "Обновить сейчас" in text:
+                    send_msg(chat_id, "⏳ Обновляю базу акций за последние 7 дней со всех источников...")
+                    update_posts_cache()
+                    send_msg(chat_id, f"✅ База обновлена! Найдено предложений за неделю: <b>{len(cached_posts)}</b>.", get_main_keyboard())
+
+                elif "Помощь" in text or "/help" in text:
+                    info = (
+                        "ℹ️ <b>Правила работы бота:</b>\n\n"
+                        "• <b>🔥 Акции дня:</b> выдаются <b>ТОЛЬКО те, которые опубликованы СЕГОДНЯ</b> (в день запроса). Никакие старые посты сюда не попадают.\n"
+                        "• <b>📅 Акции недели и товары:</b> выдаются предложения строго за <b>последние 7 дней</b> от момента клика.\n"
+                        "• <b>📊 Ранжирование:</b> выбирай диапазон (80-100%, 50-80%, до 50%), бот покажет сначала самые жирные предложения."
+                    )
+                    send_msg(chat_id, info, get_main_keyboard())
+
+        except Exception as e:
+            print(f"Ошибка в bot_updates_loop: {e}")
+            time.sleep(3)
+
+if __name__ == "__main__":
+    print("🚀 Запуск бота с жесткой фильтрацией дат...")
+    # 1. Веб-сервер для Render
+    Thread(target=start_http_server, daemon=True).start()
+
+    # 2. Мониторинг и сбор базы
+    Thread(target=monitor_loop, daemon=True).start()
+
+    # 3. Прием команд в Telegram
+    bot_updates_loop()
