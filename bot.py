@@ -15,13 +15,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8749854506:AAEv_vWyqT_rVUI4dIBMVidlyt_BEglKn
 CHAT_ID = os.getenv("CHAT_ID", "936459900")
 PORT = int(os.getenv("PORT", 10000))
 
-# Интервал автоматической фоновой проверки: 2 часа
+# Московское время (UTC+3) для точного определения текущего дня
+MSK = timezone(timedelta(hours=3))
+
+# Интервал автоматической фоновой проверки (2 часа)
 CHECK_INTERVAL_SECONDS = 2 * 3600
 
-# Источники для мониторинга: Telegram-каналы, Pepper.ru и агрегаторы акций
+# Источники для мониторинга
 CHANNELS = [
     "t_bank_tinkoff_cashback_keshbek",  # Т-Банк акции и кэшбэк дня
-    "pepperru",                         # Pepper.ru (все актуальные скидки и выгода)
+    "pepperru",                         # Pepper.ru (скидки и выгода)
     "halyavshiki",                      # Халявщики (акции, чеки, суперскидки)
     "promokody"                         # Промокоды, доставка, банки и кэшбэк
 ]
@@ -40,7 +43,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK: T-Bank & Pepper Weekly Cashback Bot is running!")
+        self.wfile.write(b"OK: T-Bank & Pepper Cashback Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -57,7 +60,7 @@ def start_http_server():
     except Exception as e:
         print(f"Предупреждение по HTTP серверу: {e}")
 
-# ==================== РАСЧЕТ И ФОРМАТИРОВАНИЕ ДАТ ====================
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def clean_html(raw_html):
     """Очищает HTML-теги и декодирует спецсимволы"""
     text = re.sub(r'<br\s*/?>', '\n', raw_html)
@@ -65,11 +68,12 @@ def clean_html(raw_html):
     text = html.unescape(text)
     return text.strip()
 
-def format_relative_time(pub_dt, now):
-    """Человекочитаемое время: '2 часа назад', '1 день назад' и т.д."""
+def format_relative_time(pub_dt, now_msk):
+    """Человекочитаемое время публикации: '2 часа назад', '1 день назад'"""
     if not pub_dt:
         return "недавно"
-    diff = now - pub_dt
+    pub_msk = pub_dt.astimezone(MSK)
+    diff = now_msk - pub_msk
     seconds = int(diff.total_seconds())
     if seconds < 60:
         return "только что"
@@ -101,7 +105,7 @@ def extract_percent(text):
     Определяет процент выгоды/кэшбэка:
     1. 100% за халяву, кэшбэк дня, за 1₽ или 0₽
     2. Явный процент: 50%, 80% и т.д.
-    3. Разница цен из Pepper: "за 28₽ (везде 74₽)" -> 62%
+    3. Разница цен из Pepper: 'за 28₽ (везде 74₽)' -> 62%
     """
     tl = text.lower()
 
@@ -130,9 +134,9 @@ def extract_percent(text):
 def categorize_post(text):
     """
     Категории:
-    1. 'day'   - Акции дня (кэшбэк дня, действуют сегодня)
+    1. 'day'   - Акции дня (кэшбэк дня, только сегодня)
     2. 'goods' - Товары с кэшбэком и скидками (чеки, конкретные товары, маркетплейсы)
-    3. 'week'  - Акции недели (общие предложения, банки, промокоды)
+    3. 'week'  - Акции недели (общие скидки, банки, промокоды)
     """
     tl = text.lower()
 
@@ -162,7 +166,7 @@ def get_main_keyboard():
     }
 
 def get_tier_inline_keyboard(category_prefix):
-    """Инлайн-кнопки фильтрации по процентам кэшбэка"""
+    """Инлайн-кнопки выбора процента кэшбэка"""
     return {
         "inline_keyboard": [
             [
@@ -201,15 +205,12 @@ def answer_callback(callback_query_id):
     except Exception:
         pass
 
-# ==================== ПАРСИНГ СТРОГО ЗА 7 ДНЕЙ ====================
+# ==================== ПАРСИНГ ====================
 def fetch_channel_posts_week(channel_name, max_pages=4):
-    """
-    Сбор постов из канала строго за последние 7 дней от момента запуска
-    """
     url = f"https://t.me/s/{channel_name}"
     items = []
-    now = datetime.now(timezone.utc)
-    week_limit = now - timedelta(days=7)
+    now_msk = datetime.now(MSK)
+    week_limit = now_msk - timedelta(days=7)
 
     for _ in range(max_pages):
         try:
@@ -243,13 +244,14 @@ def fetch_channel_posts_week(channel_name, max_pages=4):
                 try:
                     dt_str = time_m.group(1).replace("Z", "+00:00")
                     pub_dt = datetime.fromisoformat(dt_str)
-                    if oldest_on_page is None or pub_dt < oldest_on_page:
-                        oldest_on_page = pub_dt
+                    pub_msk = pub_dt.astimezone(MSK)
+                    if oldest_on_page is None or pub_msk < oldest_on_page:
+                        oldest_on_page = pub_msk
                 except Exception:
                     continue
 
-                # СТРОГАЯ ФИЛЬТРАЦИЯ: только за последние 7 дней!
-                if pub_dt < week_limit or pub_dt > now:
+                # Отсекаем посты старше 7 дней при сборе
+                if pub_msk < week_limit or pub_msk > now_msk:
                     continue
 
                 clean_txt = clean_html(text_m.group(1))
@@ -263,7 +265,6 @@ def fetch_channel_posts_week(channel_name, max_pages=4):
                     "category": categorize_post(clean_txt)
                 })
 
-            # Если самые старые посты на странице уже старше 7 дней — в прошлое больше не листаем
             if oldest_on_page and oldest_on_page < week_limit:
                 break
 
@@ -278,15 +279,14 @@ def fetch_channel_posts_week(channel_name, max_pages=4):
     return items
 
 def update_posts_cache():
-    """Сбор постов со всех каналов строго за последние 7 дней"""
+    """Сбор постов за последнюю неделю"""
     global cached_posts, last_cache_update
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Сбор акций за последние 7 дней (Pepper, Т-Банк и др.)...")
+    print(f"[{datetime.now(MSK).strftime('%H:%M:%S')}] Сбор акций за последние 7 дней...")
     all_items = []
 
     for ch in CHANNELS:
         all_items.extend(fetch_channel_posts_week(ch, max_pages=4))
 
-    # Удаление дубликатов
     seen = set()
     unique = []
     for item in all_items:
@@ -296,249 +296,8 @@ def update_posts_cache():
 
     cached_posts = unique
     last_cache_update = time.time()
-    print(f"✅ База обновлена! Всего акций за 7 дней: {len(cached_posts)}")
+    print(f"✅ База обновлена! Актуальных акций в памяти: {len(cached_posts)}")
 
 def get_filtered_posts(category=None, tier="all"):
     """
-    Фильтрация СТРОГО от текущего момента запроса:
-    - Любой пост старше 7 дней от секунды запроса отсекается.
-    - Проверяется дедлайн 'до ДД.ММ'.
-    - Ранжируется по проценту (от большего к меньшему).
-    """
-    now = datetime.now(timezone.utc)
-    week_limit = now - timedelta(days=7)
-
-    result = []
-    for p in cached_posts:
-        pub_dt = p.get("datetime")
-
-        # 1. СТРОГО: дата должна быть известна и не старше 7 дней от момента запроса!
-        if not pub_dt or pub_dt < week_limit or pub_dt > now:
-            continue
-
-        # 2. Проверка срока 'до ДД.ММ' / 'по ДД.ММ'
-        until_match = re.search(r'(?:до|по)\s+(\d{1,2})\.(\d{1,2})', p["text"].lower())
-        if until_match:
-            try:
-                d, m = int(until_match.group(1)), int(until_match.group(2))
-                year = now.year
-                if m < now.month and now.month == 12:
-                    year += 1
-                expiry_date = datetime(year, m, d, 23, 59, 59, tzinfo=timezone.utc)
-                if now > expiry_date:
-                    continue
-            except Exception:
-                pass
-
-        # 3. Фильтр по категории
-        if category and p["category"] != category:
-            continue
-
-        # 4. Фильтр по процентам
-        pct = p["percent"]
-        if tier == "80_100" and pct < 80:
-            continue
-        elif tier == "50_80" and not (50 <= pct < 80):
-            continue
-        elif tier == "0_50" and pct >= 50:
-            continue
-
-        result.append(p)
-
-    # Ранжирование: сначала максимальный %, затем самые свежие
-    result.sort(
-        key=lambda x: (x["percent"], x["datetime"]),
-        reverse=True
-    )
-    return result
-
-def format_card(p, now):
-    """Оформление карточки акции с указанием точной даты и сколько дней/часов назад"""
-    cat = p["category"]
-    pct = p["percent"]
-    ch = p["channel"]
-    dt = p["datetime"]
-
-    cat_title = {
-        "day": "🔥 АКЦИЯ ДНЯ",
-        "goods": "🛒 ТОВАР С КЭШБЭКОМ",
-        "week": "📅 АКЦИЯ ЗА НЕДЕЛЮ"
-    }.get(cat, "⚡ ВЫГОДНОЕ ПРЕДЛОЖЕНИЕ")
-
-    pct_badge = f" • <b>{pct}% Выгода/Кэшбэк</b>" if pct > 0 else ""
-    date_str = dt.strftime("%d.%m.%Y в %H:%M") if dt else "Недавно"
-    rel_str = format_relative_time(dt, now)
-
-    header = f"<b>{cat_title}</b>{pct_badge}\n<i>🕒 {date_str} ({rel_str}) • @{ch}</i>\n\n"
-    source = f"\n\n👉 <a href='https://t.me/{p['post_ref']}'>Открыть предложение в источнике</a>"
-
-    max_len = 3900 - len(header) - len(source)
-    txt = p["text"]
-    if len(txt) > max_len:
-        txt = txt[:max_len] + "..."
-
-    return header + txt + source
-
-def send_batch(chat_id, posts, empty_text, now, limit=6):
-    if not posts:
-        send_msg(chat_id, empty_text, get_main_keyboard())
-        return
-
-    send_msg(chat_id, f"🔎 Найдено предложений за неделю: <b>{len(posts)}</b>", get_main_keyboard())
-    for p in posts[:limit]:
-        send_msg(chat_id, format_card(p, now))
-        time.sleep(0.3)
-
-# ==================== ФОНОВЫЙ МОНИТОРИНГ ====================
-def monitor_loop():
-    """Фоновое обновление раз в 2 часа"""
-    update_posts_cache()
-    known_ids = {p["post_ref"] for p in cached_posts}
-
-    while True:
-        try:
-            time.sleep(CHECK_INTERVAL_SECONDS)
-            prev_ids = set(known_ids)
-            update_posts_cache()
-
-            now = datetime.now(timezone.utc)
-            for p in cached_posts:
-                if p["post_ref"] not in prev_ids:
-                    known_ids.add(p["post_ref"])
-                    # Новая акция дня уведомляет сразу
-                    if p["category"] == "day":
-                        send_msg(CHAT_ID, "🚨 <b>НОВАЯ АКЦИЯ ДНЯ!</b>\n\n" + format_card(p, now))
-        except Exception as e:
-            print(f"Ошибка в monitor_loop: {e}")
-            time.sleep(30)
-
-# ==================== ОБРАБОТКА КОМАНД И КНОПОК ====================
-def bot_updates_loop():
-    offset = 0
-    while True:
-        try:
-            # Если кэш старше 15 минут — освежаем
-            if time.time() - last_cache_update > 900 and last_cache_update > 0:
-                update_posts_cache()
-
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
-            res = requests.get(url, timeout=25).json()
-            if not res.get("ok"):
-                time.sleep(3)
-                continue
-
-            for upd in res.get("result", []):
-                offset = upd["update_id"] + 1
-                now = datetime.now(timezone.utc)
-                week_start = now - timedelta(days=7)
-
-                # 1. Инлайн-кнопки (выбор процента)
-                if "callback_query" in upd:
-                    cq = upd["callback_query"]
-                    cq_id = cq["id"]
-                    cq_data = cq.get("data", "")
-                    chat_id = cq.get("message", {}).get("chat", {}).get("id")
-                    answer_callback(cq_id)
-
-                    tier_names = {"80_100": "80% — 100%", "50_80": "50% — 80%", "0_50": "до 50%", "all": "все"}
-
-                    if cq_data.startswith("week_"):
-                        tier = cq_data.replace("week_", "")
-                        posts = get_filtered_posts(category="week", tier=tier)
-                        send_msg(
-                            chat_id,
-                            f"📅 <b>Акции за последние 7 дней ({week_start.strftime('%d.%m')} — {now.strftime('%d.%m')}):\nКэшбэк: {tier_names.get(tier, tier)}</b>"
-                        )
-                        send_batch(chat_id, posts, f"😔 В диапазоне {tier_names.get(tier)} за последние 7 дней предложений не найдено.", now)
-
-                    elif cq_data.startswith("goods_"):
-                        tier = cq_data.replace("goods_", "")
-                        posts = get_filtered_posts(category="goods", tier=tier)
-                        send_msg(
-                            chat_id,
-                            f"🛒 <b>Товары с кэшбэком за последние 7 дней ({week_start.strftime('%d.%m')} — {now.strftime('%d.%m')}):\nВыгода: {tier_names.get(tier, tier)}</b>"
-                        )
-                        send_batch(chat_id, posts, f"😔 В диапазоне {tier_names.get(tier)} за последние 7 дней товаров не найдено.", now)
-                    continue
-
-                # 2. Текстовые сообщения
-                msg = upd.get("message", {})
-                text = msg.get("text", "").strip()
-                chat_id = msg.get("chat", {}).get("id")
-
-                if not chat_id or not text:
-                    continue
-
-                if text == "/start":
-                    start_text = (
-                        "👋 <b>Привет! Бот кэшбэка и акций обновлен!</b>\n\n"
-                        f"⏱ <b>Диапазон поиска:</b> строго за <b>последние 7 дней</b> от даты запроса "
-                        f"(с <b>{week_start.strftime('%d.%m.%Y')}</b> по <b>{now.strftime('%d.%m.%Y')}</b>).\n"
-                        "🌐 <b>Источники:</b> Т-Банк, Pepper.ru, Халявщики, Промокоды.\n\n"
-                        "📂 <b>Разделы:</b>\n"
-                        "1️⃣ <b>🔥 Акции дня</b> — предложения за последние 24-36 часов.\n"
-                        "2️⃣ <b>📅 Акции недели (7 дней)</b> — акции за неделю с выбором кэшбэка (80-100%, 50-80%, до 50%).\n"
-                        "3️⃣ <b>🛒 Товары с кэшбэком</b> — чеки и товары за неделю с ранжированием.\n\n"
-                        "Выбирай кнопку внизу 👇"
-                    )
-                    send_msg(chat_id, start_text, get_main_keyboard())
-
-                elif "Акции дня" in text:
-                    posts = get_filtered_posts(category="day", tier="all")
-                    if not posts:
-                        posts = [p for p in cached_posts if (now - p["datetime"]).total_seconds() <= 36*3600]
-                    send_batch(
-                        chat_id,
-                        posts,
-                        "😔 <b>На сегодня акций дня пока нет.</b>\nОни обычно появляются в течение дня. Как только появится — бот пришлет!",
-                        now
-                    )
-
-                elif any(k in text for k in ["Акции недели", "Акции месяца", "акции за неделю"]):
-                    send_msg(
-                        chat_id,
-                        f"📅 <b>Акции за последние 7 дней (с {week_start.strftime('%d.%m')} по {now.strftime('%d.%m.%Y')}):</b>\n"
-                        "Выбери желаемый процент кэшбэка / выгоды от даты запроса 👇",
-                        get_tier_inline_keyboard("week")
-                    )
-
-                elif "Товары с кэшбэком" in text:
-                    send_msg(
-                        chat_id,
-                        f"🛒 <b>Товары с кэшбэком за последние 7 дней (с {week_start.strftime('%d.%m')} по {now.strftime('%d.%m.%Y')}):</b>\n"
-                        "Выбери желаемый процент выгоды 👇",
-                        get_tier_inline_keyboard("goods")
-                    )
-
-                elif any(k in text for k in ["Все акции", "Все акции за неделю", "Все акции сразу"]):
-                    posts = get_filtered_posts(tier="all")
-                    send_batch(chat_id, posts, "😔 Акций за последние 7 дней не найдено.", now, limit=8)
-
-                elif "Обновить базу" in text or "Обновить сейчас" in text:
-                    send_msg(chat_id, "⏳ Обновляю базу акций за последние 7 дней со всех сайтов...")
-                    update_posts_cache()
-                    send_msg(chat_id, f"✅ База обновлена! Найдено акций за неделю: <b>{len(cached_posts)}</b>.", get_main_keyboard())
-
-                elif "Помощь" in text or "/help" in text:
-                    info = (
-                        "ℹ️ <b>Как работает бот:</b>\n\n"
-                        "• <b>Период:</b> строго за последние <b>7 дней от момента твоего запроса</b>.\n"
-                        "• <b>Источники:</b> Т-Банк, Pepper.ru, каналы со скидками и чеками.\n"
-                        "• <b>Ранжирование:</b> выбирай процент (80-100%, 50-80%, до 50%), бот покажет сначала самые выгодные предложения."
-                    )
-                    send_msg(chat_id, info, get_main_keyboard())
-
-        except Exception as e:
-            print(f"Ошибка в bot_updates_loop: {e}")
-            time.sleep(3)
-
-if __name__ == "__main__":
-    print("🚀 Запуск бота кэшбэка за неделю...")
-    # 1. Веб-сервер для Render
-    Thread(target=start_http_server, daemon=True).start()
-
-    # 2. Мониторинг и сбор базы
-    Thread(target=monitor_loop, daemon=True).start()
-
-    # 3. Прием команд в Telegram
-    bot_updates_loop()
+    СТРОГАЯ ФИ
